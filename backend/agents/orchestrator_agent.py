@@ -1,5 +1,4 @@
-"""Orchestrator Agent (Head Coach): plan, route to specialists, synthesize."""
-import json
+"""Orchestrator Agent (Head Coach): autonomous ReAct reasoning loop."""
 import logging
 import re
 from typing import Any
@@ -10,94 +9,185 @@ from backend.rag.retrieval import get_nutrition_context, get_research_context
 
 logger = logging.getLogger(__name__)
 MODULE_NAME = "Orchestrator Agent"
+MAX_ITERATIONS = 5
 
-PLAN_PROMPT = """You are the Head Coach of Vita, an AI wellness and nutrition coach. Given the user's request, break it into 1-3 clear sub-tasks and assign each to exactly one specialist.
+# Canonical specialist names for fuzzy matching
+_SPECIALIST_ALIASES: dict[str, str] = {
+    "nutrition expert": "Nutrition Expert",
+    "nutritionexpert": "Nutrition Expert",
+    "nutrition": "Nutrition Expert",
+    "science researcher": "Science Researcher",
+    "scienceresearcher": "Science Researcher",
+    "science": "Science Researcher",
+    "researcher": "Science Researcher",
+    "wellness coach": "Wellness Coach",
+    "wellnesscoach": "Wellness Coach",
+    "wellness": "Wellness Coach",
+    "coach": "Wellness Coach",
+}
 
-Specialists:
-- "Nutrition Expert": diet, food, nutrients, meals, branded products, ingredients, Nutri-score.
-- "Science Researcher": evidence, research, clinical trials, medical facts, "is X supported by science".
-- "Wellness Coach": stress, exercise, sleep, mindfulness, non-diet habits.
+REACT_SYSTEM_PROMPT = """You are the Head Coach of Vita, an AI wellness and nutrition coach.
 
-Reply with ONLY a JSON array, no other text. Each element: {"task": "sub-task description", "specialist": "Nutrition Expert"|"Science Researcher"|"Wellness Coach"}.
-Example: [{"task": "Suggest a healthy breakfast", "specialist": "Nutrition Expert"}, {"task": "Is it evidence-based?", "specialist": "Science Researcher"}]
+You solve the user's request by reasoning step-by-step. Each turn you MUST output exactly one block in this format:
 
-User request:
+Thought: <your reasoning about what to do next>
+Action: <one of the available actions>
+Action Input: <input for the action>
+
+Available actions:
+- call_specialist(Nutrition Expert, <task>) — diet, food, nutrients, meals, ingredients
+- call_specialist(Science Researcher, <task>) — evidence, research, clinical trials, medical facts
+- call_specialist(Wellness Coach, <task>) — stress, exercise, sleep, mindfulness, habits
+- search_nutrition(<query>) — direct RAG lookup for nutrition data
+- search_research(<query>) — direct RAG lookup for research/pubmed data
+- finish(<response>) — return the final answer to the user
+
+Rules:
+- Always start with a Thought.
+- Call specialists or search tools to gather info before finishing.
+- You may call multiple specialists across turns if needed.
+- When you have enough information, use finish() with your complete, friendly final response.
+- Do NOT output anything after "Action Input:".
 """
-SYNTHESIS_PROMPT = """You are the Head Coach of Vita. Below are the user's request and the specialists' answers. Write one concise, friendly final response that addresses the user's request. Do not repeat raw outputs; integrate them into a coherent answer.
-
-User request: {user_prompt}
-
-Specialist answers:
-{specialist_outputs}
-
-Final response:
-"""
 
 
-def _parse_plan(raw: str) -> list[dict[str, str]]:
-    """Extract JSON array of {task, specialist} from LLM output."""
-    raw = raw.strip()
-    # Try to find a JSON array
-    match = re.search(r"\[[\s\S]*\]", raw)
-    if match:
+def _normalize_specialist(name: str) -> str:
+    """Normalize a specialist name to its canonical form."""
+    key = name.strip().lower()
+    if key in _SPECIALIST_ALIASES:
+        return _SPECIALIST_ALIASES[key]
+    # Fallback: return cleaned-up original
+    return name.strip()
+
+
+def _parse_react_output(text: str) -> dict[str, str]:
+    """Parse Thought / Action / Action Input from LLM output.
+
+    Returns dict with keys: thought, action, action_input.
+    """
+    thought = ""
+    action = ""
+    action_input = ""
+
+    thought_match = re.search(r"Thought:\s*(.+?)(?=\nAction:|\Z)", text, re.DOTALL)
+    if thought_match:
+        thought = thought_match.group(1).strip()
+
+    action_match = re.search(r"Action:\s*(.+?)(?=\nAction Input:|\Z)", text, re.DOTALL)
+    if action_match:
+        action = action_match.group(1).strip()
+
+    input_match = re.search(r"Action Input:\s*(.+)", text, re.DOTALL)
+    if input_match:
+        action_input = input_match.group(1).strip()
+
+    return {"thought": thought, "action": action, "action_input": action_input}
+
+
+def _execute_action(action: str, action_input: str, steps: list[dict[str, Any]]) -> str:
+    """Dispatch an action to the appropriate specialist or RAG function.
+
+    Returns the observation string.
+    """
+    # call_specialist(Specialist Name, task)
+    cs_match = re.match(r"call_specialist\(\s*(.+?)\s*,\s*(.+?)\s*\)$", action, re.DOTALL)
+    if cs_match:
+        specialist_name = _normalize_specialist(cs_match.group(1))
+        task = cs_match.group(2).strip()
+    elif action.lower().startswith("call_specialist"):
+        # Fallback: action_input contains "Specialist Name, task"
+        parts = action_input.split(",", 1)
+        specialist_name = _normalize_specialist(parts[0])
+        task = parts[1].strip() if len(parts) > 1 else action_input
+    else:
+        specialist_name = None
+        task = None
+
+    if specialist_name and task:
+        # Inject RAG context for relevant specialists
+        context = ""
+        if specialist_name == "Nutrition Expert":
+            context = get_nutrition_context(task)
+        elif specialist_name == "Science Researcher":
+            context = get_research_context(task)
         try:
-            data = json.loads(match.group())
-            if isinstance(data, list):
-                out = []
-                for item in data:
-                    if isinstance(item, dict) and "task" in item and "specialist" in item:
-                        spec = item["specialist"]
-                        if spec in ("Nutrition Expert", "Science Researcher", "Wellness Coach"):
-                            out.append({"task": str(item["task"]), "specialist": spec})
-                if out:
-                    return out
-        except json.JSONDecodeError:
-            pass
-    return [{"task": raw or "Address the user request.", "specialist": "Wellness Coach"}]
+            response_text, step_dict = run_specialist(specialist_name, task, context=context)
+            steps.append(step_dict)
+            return response_text
+        except Exception as e:
+            logger.exception("Specialist %s failed", specialist_name)
+            steps.append({"module": specialist_name, "prompt": {"task": task}, "response": {"error": str(e)}})
+            return f"Error calling {specialist_name}: {e}"
+
+    # search_nutrition(query)
+    sn_match = re.match(r"search_nutrition\(\s*(.+?)\s*\)$", action, re.DOTALL)
+    if sn_match:
+        query = sn_match.group(1)
+        result = get_nutrition_context(query)
+        return result or "No nutrition data found."
+
+    # search_research(query)
+    sr_match = re.match(r"search_research\(\s*(.+?)\s*\)$", action, re.DOTALL)
+    if sr_match:
+        query = sr_match.group(1)
+        result = get_research_context(query)
+        return result or "No research data found."
+
+    # finish(response) — handled in the main loop, but just in case
+    if action.lower().startswith("finish"):
+        return action_input
+
+    return f"Unknown action: {action}"
+
+
+def _force_finish(prompt: str, scratchpad: str, steps: list[dict[str, Any]]) -> str:
+    """Force a final synthesis when max iterations are reached."""
+    messages = [
+        {"role": "system", "content": "You are the Head Coach of Vita, an AI wellness and nutrition coach. Synthesize everything gathered so far into one concise, friendly response."},
+        {"role": "user", "content": f"User request: {prompt}\n\nResearch so far:\n{scratchpad}\n\nPlease provide your final answer now."},
+    ]
+    final_content, raw_response = llm_client.chat_with_raw_response(messages)
+    steps.append({"module": MODULE_NAME, "prompt": {"messages": messages}, "response": raw_response})
+    return final_content
 
 
 def run(prompt: str) -> tuple[str, list[dict[str, Any]]]:
-    """Run the orchestrator: plan, call specialists, synthesize. Returns (final_response, steps)."""
+    """Run the orchestrator ReAct loop. Returns (final_response, steps)."""
     steps: list[dict[str, Any]] = []
+    scratchpad = ""
 
-    # 1. Plan + route
-    plan_messages = [
-        {"role": "system", "content": "You output only valid JSON. No markdown, no explanation."},
-        {"role": "user", "content": PLAN_PROMPT + prompt},
-    ]
-    plan_content, plan_raw = llm_client.chat_with_raw_response(plan_messages)
-    steps.append({"module": MODULE_NAME, "prompt": {"messages": plan_messages}, "response": plan_raw})
+    for iteration in range(MAX_ITERATIONS):
+        # Build messages for this iteration
+        messages = [
+            {"role": "system", "content": REACT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"User request: {prompt}\n\n{scratchpad}".strip()},
+        ]
 
-    sub_tasks = _parse_plan(plan_content)
+        # Call LLM
+        llm_output, raw_response = llm_client.chat_with_raw_response(messages)
+        steps.append({"module": MODULE_NAME, "prompt": {"messages": messages}, "response": raw_response})
 
-    # 2. Call specialists (RAG context for Nutrition / Science)
-    specialist_outputs: list[str] = []
-    for i, st in enumerate(sub_tasks):
-        task, specialist = st["task"], st["specialist"]
-        context = ""
-        if specialist == "Nutrition Expert":
-            context = get_nutrition_context(task)
-        elif specialist == "Science Researcher":
-            context = get_research_context(task)
-        try:
-            response_text, step_dict = run_specialist(specialist, task, context=context)
-            specialist_outputs.append(f"[{specialist}] {task}\n{response_text}")
-            steps.append(step_dict)
-        except Exception as e:
-            logger.exception("Specialist %s failed", specialist)
-            specialist_outputs.append(f"[{specialist}] {task}\nError: {e}")
-            steps.append({
-                "module": specialist,
-                "prompt": {"task": task},
-                "response": {"error": str(e)},
-            })
+        # Parse Thought / Action / Action Input
+        parsed = _parse_react_output(llm_output)
+        thought = parsed["thought"]
+        action = parsed["action"]
+        action_input = parsed["action_input"]
 
-    # 3. Synthesize
-    combined = "\n\n".join(specialist_outputs)
-    synth_messages = [
-        {"role": "user", "content": SYNTHESIS_PROMPT.format(user_prompt=prompt, specialist_outputs=combined)},
-    ]
-    final_content, synth_raw = llm_client.chat_with_raw_response(synth_messages)
-    steps.append({"module": MODULE_NAME, "prompt": {"messages": synth_messages}, "response": synth_raw})
+        logger.info("Iteration %d — Thought: %s | Action: %s", iteration + 1, thought[:80], action[:80] if action else "")
 
-    return final_content, steps
+        # Check for finish action
+        finish_match = re.match(r"finish\(\s*(.+?)\s*\)$", action, re.DOTALL | re.IGNORECASE)
+        if finish_match:
+            return finish_match.group(1), steps
+        if action.lower() == "finish":
+            return action_input, steps
+
+        # Execute the action
+        observation = _execute_action(action, action_input, steps)
+
+        # Append to scratchpad
+        scratchpad += f"\nThought: {thought}\nAction: {action}\nAction Input: {action_input}\nObservation: {observation}\n"
+
+    # Max iterations reached — force finish
+    logger.warning("Max iterations (%d) reached, forcing synthesis.", MAX_ITERATIONS)
+    return _force_finish(prompt, scratchpad, steps), steps
